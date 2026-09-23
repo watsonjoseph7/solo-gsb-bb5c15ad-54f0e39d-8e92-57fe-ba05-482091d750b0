@@ -16,7 +16,7 @@ docker compose up --build
 
 依赖安装与建表均在启动时自动完成：Compose 启动 Postgres 16 与 API 两个容器，
 API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` /
-`reveals` / `deadline_extensions`）。
+`reveals` / `deadline_extensions` / `settlements`）。
 两个容器均带 healthcheck，`docker compose ps` 中状态变为 `healthy` 即就绪。
 
 ## 承诺哈希方案
@@ -40,7 +40,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 |------|----------|----------|
 | `commit` | 创建时刻 ≤ now < commit_deadline | 提交承诺 |
 | `reveal` | commit_deadline ≤ now < reveal_deadline | 提交揭示 |
-| `closed` | now ≥ reveal_deadline | 只读 |
+| `closed` | now ≥ reveal_deadline | 只读；可提交标准结果永久结算、查询结算 |
 
 边界语义：到达 commit_deadline 的瞬间提交通道关闭、揭示通道开启；到达 reveal_deadline 揭示通道关闭。
 
@@ -60,6 +60,8 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
 | POST | `/events/{id}/reveals/batch` | 原子批量揭示 1～100 组原文与盐（单事务，冲突整体回滚） |
+| POST | `/events/{id}/settlement` | closed 后提交非空标准结果并永久结算（仅首次生效） |
+| GET | `/events/{id}/settlement` | 查询结算（未结算返回 `status=pending`） |
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
@@ -94,7 +96,78 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals \
 
 # 5. 获取可核验时间线（含原文与盐，任何人可重算哈希比对）
 curl -s http://localhost:8000/events/<EVENT_ID>/timeline
+
+# 6. 到达 reveal_deadline 事件进入 closed 后，提交非空标准结果永久结算
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/settlement \
+  -H 'Content-Type: application/json' \
+  -d '{"standard_result": "明天下雨"}'
+# => {"status": "confirmed", "standard_result": "明天下雨",
+#     "correct_count": 1, "incorrect_count": 0, "unrevealed_count": 1, ...}
+
+# 7. 查询结算（未结算时返回明确的 pending 状态）
+curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 ```
+
+## 结果结算（`POST` / `GET /events/{id}/settlement`）
+
+事件进入 **closed** 阶段后，调用方可提交一个**非空标准结果**永久确认结算：服务端将
+标准结果与该事件每条已接受揭示的 `original_text` 做**区分大小写、不去除任何空白**
+的精确匹配（`==` 语义），返回三类计数：
+
+- `correct_count`：揭示原文与标准结果**完全相同**的承诺数量；
+- `incorrect_count`：已揭示、但原文与标准结果不匹配的承诺数量；
+- `unrevealed_count`：从未揭示的承诺数量（揭示期结束即定格）。
+
+三者之和 `total_count` 为事件的全部承诺数量；事件没有任何承诺时三个计数均为 0。
+计数在确认时刻快照写入 `settlements` 表，结算后事件数据只读、结果**永久不可改写**。
+
+```bash
+# closed 后结算（200）
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/settlement \
+  -H 'Content-Type: application/json' \
+  -d '{"standard_result": "YES"}'
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "status": "confirmed",
+  "standard_result": "YES",
+  "settled_at": "2030-01-02T00:00:05Z",
+  "correct_count": 1,
+  "incorrect_count": 1,
+  "unrevealed_count": 1,
+  "total_count": 3
+}
+```
+
+**永久确认与重复结算**：每个事件至多一条结算记录。重复提交（无论标准结果是否与首次
+相同、无论时钟推进多久）一律返回 `409 SETTLEMENT_ALREADY_CONFIRMED`，**既有标准结果
+与计数不被改写**；并发下由事件行锁与 `settlements.event_id` 唯一约束保证仅首次结算
+生效，竞争落败方收到相同 409。需要读取既有结果时使用查询接口：
+
+```bash
+# 已结算：返回确认值
+curl -s http://localhost:8000/events/<EVENT_ID>/settlement
+# {"event_id": "...", "status": "confirmed", "standard_result": "YES", ...}
+
+# 尚未结算（事件存在但未确认）：返回 200 与明确状态，各结果字段为 null
+curl -s http://localhost:8000/events/<EVENT_ID>/settlement
+# {"event_id": "...", "status": "pending", "standard_result": null,
+#  "settled_at": null, "correct_count": null, "incorrect_count": null,
+#  "unrevealed_count": null, "total_count": null}
+```
+
+每次成功结算还会作为 `settlement_confirmed` 条目出现在事件时间线中
+（含标准结果与三类计数，按发生时间排序）。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 结算成功；或查询成功（未结算时 `status=pending`） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 409 | `SETTLEMENT_NOT_CLOSED` | 事件仍处于 commit / reveal 阶段（未到 reveal_deadline） |
+| 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已结算，重复提交被拒绝且既有结果不变 |
+| 422 | — | `standard_result` 缺失/为空串/超过 10000 字符，或事件 ID 非 UUID |
 
 ## 受约束的截止时间延长（`POST /events/{id}/extend`）
 
@@ -472,10 +545,13 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 | 409 | `NO_MATCHING_COMMITMENT` | 原文 + 盐重算后不匹配任何承诺 |
 | 409 | `DUPLICATE_REVEAL` | 该承诺已被揭示（仅首次匹配生效） |
 | 409 | `BATCH_REVEAL_CONFLICT` | 批量揭示存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type 与原文、盐、重算哈希） |
-| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason） |
+| 409 | `SETTLEMENT_NOT_CLOSED` | 事件尚未进入 closed 阶段即提交结算 |
+| 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复提交被拒绝且不改变既有结果 |
+| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
-后到者事务回滚并收到 `DUPLICATE_REVEAL`。
+后到者事务回滚并收到 `DUPLICATE_REVEAL`。结算同理：`settlements.event_id` 唯一约束
+与事件行锁保证并发结算仅首次确认生效，后到者收到 `SETTLEMENT_ALREADY_CONFIRMED`。
 
 ## 本地开发与测试
 
@@ -500,7 +576,7 @@ Compose 编排说明（见 `docker-compose.yml`）：
   启动命令为 `uvicorn app.main:app --host 0.0.0.0 --port 8000`），
   通过 `depends_on: condition: service_healthy` 等待数据库健康后再启动，
   启动时自动建表（`events` / `commitments` / `reveals` /
-  `deadline_extensions`），宿主端口 `8000`；自带 `/health` healthcheck。
+  `deadline_extensions` / `settlements`），宿主端口 `8000`；自带 `/health` healthcheck。
 - API 通过环境变量 `DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/predictions`
   连接数据库；如本机 5432 或 8000 端口被占用，可在 `docker-compose.yml`
   中修改 `ports` 映射（容器内端口不变）。
@@ -531,7 +607,7 @@ app/
   clock.py      # 统一时钟（阶段判定与记录 created_at 的唯一时间来源，可整体替换）
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
   scheduling.py # 阶段窗口资源排程：最少轨道的确定性区间着色（纯函数，可独立单测）
-  models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
+  models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions / settlements）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
@@ -542,6 +618,7 @@ tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
+tests/test_settlement.py      # 结果结算：closed 限制、精确匹配计数、重复冲突与 pending 查询
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

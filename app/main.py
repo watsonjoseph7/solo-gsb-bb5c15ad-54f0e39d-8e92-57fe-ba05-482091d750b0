@@ -3,7 +3,7 @@
 生命周期（所有时间点均按服务端 UTC 判定）：
   [创建, commit_deadline)   commit 阶段：可提交承诺
   [commit_deadline, reveal_deadline)  reveal 阶段：可揭示
-  [reveal_deadline, ∞)      closed：只读
+  [reveal_deadline, ∞)      closed：揭示只读；可提交标准结果永久结算（每事件一次）
 """
 
 import logging
@@ -21,7 +21,7 @@ from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from . import clock
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
-from .models import Commitment, DeadlineExtension, Event, Reveal
+from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
 from .scheduling import PHASES as SCHEDULE_PHASES, schedule
 from .schemas import (
     COMMITMENT_HASH_PATTERN,
@@ -44,6 +44,8 @@ from .schemas import (
     ScheduleConflictPairOut,
     ScheduleOut,
     ScheduleRequest,
+    SettlementCreate,
+    SettlementOut,
     TimelineOut,
 )
 
@@ -207,6 +209,35 @@ def extension_out(ext: DeadlineExtension) -> DeadlineExtensionOut:
         new_reveal_deadline=as_utc(ext.new_reveal_deadline),
         reason=ext.reason,
         extended_at=as_utc(ext.created_at),
+    )
+
+
+def settlement_out(settlement: Settlement) -> SettlementOut:
+    return SettlementOut(
+        event_id=settlement.event_id,
+        status="confirmed",
+        standard_result=settlement.standard_result,
+        settled_at=as_utc(settlement.created_at),
+        correct_count=settlement.correct_count,
+        incorrect_count=settlement.incorrect_count,
+        unrevealed_count=settlement.unrevealed_count,
+        total_count=settlement.correct_count
+        + settlement.incorrect_count
+        + settlement.unrevealed_count,
+    )
+
+
+def pending_settlement_out(event: Event) -> SettlementOut:
+    """事件尚未结算时的明确状态响应。"""
+    return SettlementOut(
+        event_id=event.id,
+        status="pending",
+        standard_result=None,
+        settled_at=None,
+        correct_count=None,
+        incorrect_count=None,
+        unrevealed_count=None,
+        total_count=None,
     )
 
 
@@ -1043,6 +1074,104 @@ def submit_reveals_batch(
 
 
 # --------------------------------------------------------------------------- #
+# 结算
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/{event_id}/settlement", response_model=SettlementOut)
+def settle_event(event_id: UUID, payload: SettlementCreate, db: Session = Depends(get_db)):
+    """事件进入 closed 后永久确认标准结果并按揭示原文精确匹配结算。
+
+    结算规则：
+      - 仅在事件 closed（now >= reveal_deadline）后可调用；commit / reveal
+        阶段返回 409 SETTLEMENT_NOT_CLOSED；
+      - 请求体 standard_result 必须为非空文本（1～10000 字符；空串或缺失为
+        422），与每条已接受揭示的 original_text 做区分大小写、不去除空白的
+        精确匹配；
+      - 返回 correct_count（原文 == 标准结果）、incorrect_count（已揭示但不
+        匹配）、unrevealed_count（从未揭示的承诺数），三者之和为全部承诺数；
+      - 标准结果一经确认即永久不可改写：重复结算（即使提交相同结果）返回
+        409 SETTLEMENT_ALREADY_CONFIRMED，且不改动既有结算；
+      - 并发下仅首次结算生效：事件行锁串行化校验与写入，唯一约束兜底。
+    """
+    # 行锁串行化并发结算：校验与写入在同一事务内完成
+    event = db.query(Event).filter(Event.id == event_id).with_for_update().first()
+    if event is None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {event_id} 不存在")
+
+    existing = (
+        db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
+    )
+    if existing is not None:
+        db.rollback()
+        raise api_error(
+            409,
+            "SETTLEMENT_ALREADY_CONFIRMED",
+            f"事件 {event_id} 已于 {as_utc(existing.created_at).isoformat()} 结算，"
+            "标准结果永久确认且不可改写；可通过 GET /events/{event_id}/settlement 查询既有结算",
+        )
+
+    now = now_utc()
+    reveal_dl = as_utc(event.reveal_deadline)
+    if now < reveal_dl:
+        db.rollback()
+        raise api_error(
+            409,
+            "SETTLEMENT_NOT_CLOSED",
+            f"仅允许在事件 closed 后结算：揭示截止时间为 {reveal_dl.isoformat()}，"
+            f"当前服务端时间 {now.isoformat()}，事件仍处于 commit/reveal 阶段",
+        )
+
+    total_count = (
+        db.query(Commitment).filter(Commitment.event_id == event.id).count()
+    )
+    reveals = db.query(Reveal.original_text).filter(Reveal.event_id == event.id).all()
+    # 区分大小写、不去除空白的精确匹配
+    correct_count = sum(1 for (text,) in reveals if text == payload.standard_result)
+    revealed_count = len(reveals)
+    incorrect_count = revealed_count - correct_count
+    unrevealed_count = total_count - revealed_count
+
+    settlement = Settlement(
+        event_id=event.id,
+        standard_result=payload.standard_result,
+        correct_count=correct_count,
+        incorrect_count=incorrect_count,
+        unrevealed_count=unrevealed_count,
+    )
+    db.add(settlement)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发竞争：另一事务已抢先结算。回滚，既有结果不变
+        db.rollback()
+        winner = db.query(Settlement).filter(Settlement.event_id == event.id).one()
+        raise api_error(
+            409,
+            "SETTLEMENT_ALREADY_CONFIRMED",
+            f"事件 {event_id} 已于 {as_utc(winner.created_at).isoformat()} 结算，"
+            "标准结果永久确认且不可改写；可通过 GET /events/{event_id}/settlement 查询既有结算",
+        )
+    return settlement_out(settlement)
+
+
+@app.get("/events/{event_id}/settlement", response_model=SettlementOut)
+def get_settlement(event_id: UUID, db: Session = Depends(get_db)):
+    """查询事件结算。
+
+    事件存在但尚未结算时返回 200 与明确状态 status=pending（标准结果、确认
+    时间与各项计数均为 null）；已结算时返回 status=confirmed 及确认时刻
+    快照的标准结果与正确/错误/未揭示计数。事件不存在返回 404。
+    """
+    event = get_event_or_404(db, event_id)
+    settlement = (
+        db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
+    )
+    if settlement is None:
+        return pending_settlement_out(event)
+    return settlement_out(settlement)
+
+
+# --------------------------------------------------------------------------- #
 # 时间线
 # --------------------------------------------------------------------------- #
 
@@ -1128,7 +1257,25 @@ def get_timeline(event_id: UUID, db: Session = Depends(get_db)):
                 }
             )
 
-    # 稳定排序：同一时间戳下保持 承诺 -> 揭示 的先后
+    settlement = (
+        db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
+    )
+    if settlement is not None:
+        entries.append(
+            {
+                "type": "settlement_confirmed",
+                "at": as_utc(settlement.created_at),
+                "detail": {
+                    "settlement_id": str(settlement.id),
+                    "standard_result": settlement.standard_result,
+                    "correct_count": settlement.correct_count,
+                    "incorrect_count": settlement.incorrect_count,
+                    "unrevealed_count": settlement.unrevealed_count,
+                },
+            }
+        )
+
+    # 稳定排序：同一时间戳下保持 承诺 -> 揭示 -> 结算 的先后
     entries.sort(key=lambda e: e["at"])
     timeline = [
         {"seq": i + 1, "type": e["type"], "at": e["at"], "detail": e["detail"]}

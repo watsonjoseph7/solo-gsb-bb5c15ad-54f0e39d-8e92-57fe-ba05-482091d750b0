@@ -139,9 +139,41 @@ class RevealBatchOut(BaseModel):
     reveals: list[RevealOut] = Field(description="按输入顺序写入的揭示记录，全部 verified=true")
 
 
+class SettlementCreate(BaseModel):
+    standard_result: str = Field(
+        min_length=1,
+        max_length=10000,
+        description="标准结果原文（非空 UTF-8 文本）；与已揭示原文做区分大小写、不做修剪的精确匹配",
+    )
+
+
+class SettlementOut(BaseModel):
+    event_id: UUID
+    status: str = Field(description="结算状态：confirmed（已永久确认）| pending（尚未结算）")
+    standard_result: Optional[str] = Field(
+        default=None, description="已确认的标准结果原文；未结算时为 null"
+    )
+    settled_at: Optional[datetime] = Field(
+        default=None, description="结算确认时间（UTC）；未结算时为 null"
+    )
+    correct_count: Optional[int] = Field(
+        default=None, description="揭示原文与标准结果精确匹配的数量；未结算时为 null"
+    )
+    incorrect_count: Optional[int] = Field(
+        default=None, description="已揭示但原文与标准结果不匹配的数量；未结算时为 null"
+    )
+    unrevealed_count: Optional[int] = Field(
+        default=None, description="从未揭示的承诺数量；未结算时为 null"
+    )
+    total_count: Optional[int] = Field(
+        default=None,
+        description="事件全部承诺数量（等于正确+错误+未揭示）；未结算时为 null",
+    )
+
+
 class TimelineEntry(BaseModel):
     seq: int
-    type: str  # event_created | commitment_submitted | reveal_accepted | deadline_extended
+    type: str  # event_created | commitment_submitted | reveal_accepted | deadline_extended | settlement_confirmed
     at: datetime
     detail: dict[str, Any]
 

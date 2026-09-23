@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from . import clock
@@ -75,3 +75,24 @@ class Reveal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: clock.now_utc())
 
     commitment: Mapped[Commitment] = relationship(back_populates="reveal")
+
+
+class Settlement(Base):
+    """事件 closed 后的永久结算记录（每事件至多一条）。
+
+    标准结果一经确认即不可改写：event_id 唯一约束兜底并发下「仅首次结算生效」。
+    correct / incorrect / unrevealed 三个计数在结算时刻快照写入，反映确认时
+    全部已揭示承诺的统计；此后事件数据只读，计数保持不变。
+    """
+
+    __tablename__ = "settlements"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("events.id", ondelete="CASCADE"), unique=True
+    )
+    standard_result: Mapped[str] = mapped_column(Text)
+    correct_count: Mapped[int] = mapped_column(Integer)
+    incorrect_count: Mapped[int] = mapped_column(Integer)
+    unrevealed_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: clock.now_utc())
