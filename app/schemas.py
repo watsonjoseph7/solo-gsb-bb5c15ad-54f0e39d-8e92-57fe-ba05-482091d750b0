@@ -154,6 +154,38 @@ class TimelineOut(BaseModel):
     entries: list[TimelineEntry]
 
 
+class SettlementCreate(BaseModel):
+    standard_result: str = Field(
+        min_length=1,
+        description="非空标准结果（UTF-8，按揭示原文逐字符精确匹配）",
+    )
+
+
+class SettlementOut(BaseModel):
+    event_id: UUID
+    status: str = Field(description="unsettled | settled")
+    standard_result: Optional[str] = Field(
+        default=None,
+        description="已永久确认的标准结果；未结算时为 null",
+    )
+    correct_count: Optional[int] = Field(
+        default=None,
+        description="已揭示且原文与标准结果精确匹配的承诺数；未结算时为 null",
+    )
+    incorrect_count: Optional[int] = Field(
+        default=None,
+        description="已揭示但原文与标准结果不匹配的承诺数；未结算时为 null",
+    )
+    unrevealed_count: Optional[int] = Field(
+        default=None,
+        description="从未揭示的承诺数；未结算时为 null",
+    )
+    settled_at: Optional[datetime] = Field(
+        default=None,
+        description="结算永久确认时间（UTC）；未结算时为 null",
+    )
+
+
 class ConflictRequest(BaseModel):
     event_ids: list[UUID] = Field(
         default_factory=list,

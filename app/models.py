@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from . import clock
@@ -21,6 +21,10 @@ class Event(Base):
 
     commitments: Mapped[list["Commitment"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
+    )
+
+    settlement: Mapped[Optional["Settlement"]] = relationship(
+        back_populates="event", uselist=False
     )
 
 
@@ -75,3 +79,30 @@ class Reveal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: clock.now_utc())
 
     commitment: Mapped[Commitment] = relationship(back_populates="reveal")
+
+
+class Settlement(Base):
+    """事件的永久结算确认（每个事件至多一条）。
+
+    仅在事件进入 closed 阶段后允许创建；写入后不可修改——重复结算请求
+    返回 409 且既有结果不被改写。三个计数在写入时固化为快照，与
+    reveals 表当前状态无关，保证结算结果永久确定。
+    """
+
+    __tablename__ = "settlements"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # 每个事件至多结算一次：唯一约束保证并发下「仅首次确认生效」
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("events.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    standard_result: Mapped[str] = mapped_column(Text)
+    # 写入时固化的计数快照：正确数 / 错误数 / 未揭示数
+    correct_count: Mapped[int] = mapped_column(Integer)
+    incorrect_count: Mapped[int] = mapped_column(Integer)
+    unrevealed_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: clock.now_utc())
+
+    event: Mapped[Event] = relationship(back_populates="settlement")
